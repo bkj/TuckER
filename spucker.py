@@ -1,4 +1,11 @@
+#!/usr/bin/env python
+
+"""
+    spucker.py
+"""
+
 import sys
+import json
 import argparse
 import numpy as np
 from tqdm import tqdm
@@ -10,7 +17,7 @@ from torch import nn
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset",         type=str,   default="FB15k-237")
-    parser.add_argument("--num_iterations",  type=int,   default=500)
+    parser.add_argument("--epochs",          type=int,   default=50)
     parser.add_argument("--batch_size",      type=int,   default=128)
     parser.add_argument("--lr",              type=float, default=0.0005)
     parser.add_argument("--dr",              type=float, default=1.0)
@@ -53,9 +60,7 @@ data = train_data + valid_data + test_data
 
 sub, pred, obj = list(zip(*data))
 
-entities = set.union(set(sub), set(obj))
-
-entities  = sorted(list(entities))
+entities  = sorted(list(set.union(set(sub), set(obj))))
 relations = sorted(list(set(pred)))
 
 entity_lookup   = dict(zip(entities, range(len(entities))))
@@ -73,30 +78,31 @@ test_data_idxs = [(
     entity_lookup[x[0]], relation_lookup[x[1]], entity_lookup[x[2]],
 ) for x in test_data]
 
-
 # --
 
-class SliceDict:
+class AdjList:
     def __init__(self, data_idxs):
         
         slice_dict = defaultdict(list)
         for s, p, o in data_idxs:
             slice_dict[(s, p)].append(o)
-    
+        
         self._slice_dict = dict(slice_dict)
         self._keys = list(self._slice_dict.keys())
     
     def __len__(self):
         return len(self._slice_dict)
     
-    def get_batch(self, idxs):
-        
+    def get_batch_by_idx(self, idxs):
+        keys = [self._keys[idx] for idx in idxs]
+        return self.get_batch_by_keys(keys)
+    
+    def get_batch_by_keys(self, keys):
         xb = {"s" : [], "p" : []}
         yb = {"i" : [], "j" : []}
         
         s, p, o = [], [], []
-        for offset, idx in enumerate(idxs):
-            k = self._keys[idx]
+        for offset, k in enumerate(keys):
             
             xb['s'].append(k[0])
             xb['p'].append(k[1])
@@ -108,18 +114,16 @@ class SliceDict:
         return xb, yb
 
 
-train_data_slices = SliceDict(train_data_idxs)
-valid_data_slices = SliceDict(valid_data_idxs)
-test_data_slices  = SliceDict(test_data_idxs)
-
+train_adjlist = AdjList(train_data_idxs)
+valid_adjlist = AdjList(valid_data_idxs)
+test_adjlist  = AdjList(test_data_idxs)
+all_adjlist   = AdjList(train_data_idxs + valid_data_idxs + test_data_idxs)
 
 # --
 # Define model
 
-
 def sparse_bce_with_logits(x, i, j):
-    # !! Add label smoothing
-    
+    # !! Add support for label smoothing
     t1 = x.clamp(min=0).mean()
     t2 = - x[(i, j)].sum() / x.numel()
     t3 = torch.log(1 + torch.exp(-torch.abs(x))).mean()
@@ -130,6 +134,8 @@ def sparse_bce_with_logits(x, i, j):
 class Spucker(nn.Module):
     def __init__(self, num_entities, num_relations, ent_emb_dim, rel_emb_dim):
         super().__init__()
+        
+        self.ent_emb_dim = ent_emb_dim
         
         self.E = torch.nn.Embedding(num_entities, ent_emb_dim, padding_idx=0)
         self.R = torch.nn.Embedding(num_relations, rel_emb_dim, padding_idx=0)
@@ -145,9 +151,9 @@ class Spucker(nn.Module):
             )
         )
         
-        input_dropout   = 0.3
-        hidden_dropout1 = 0.4
-        hidden_dropout2 = 0.5
+        input_dropout   = args.input_dropout
+        hidden_dropout1 = args.hidden_dropout1
+        hidden_dropout2 = args.hidden_dropout2
         
         self.input_dropout   = torch.nn.Dropout(input_dropout)
         self.hidden_dropout1 = torch.nn.Dropout(hidden_dropout1)
@@ -160,15 +166,19 @@ class Spucker(nn.Module):
         e1 = self.E(e1_idx)
         r  = self.R(r_idx)
         
-        x  = self.input_dropout(self.bn0(e1))
-        x  = x.view(-1, 1, e1.size(1))
+        print(e1.shape)
+        
+        x = self.input_dropout(self.bn0(e1))
+        print(x.shape)
+        x = x.unsqueeze(-2)
+        print(x.shape)
         
         W_mat = torch.mm(r, self.W.view(r.size(1), -1))
-        W_mat = W_mat.view(-1, e1.size(1), e1.size(1))
+        W_mat = W_mat.view(-1, self.ent_emb_dim, self.ent_emb_dim)
         W_mat = self.hidden_dropout1(W_mat)
         
         x = torch.bmm(x, W_mat)
-        x = x.view(-1, e1.size(1))
+        x = x.view(-1, self.ent_emb_dim)
         x = self.hidden_dropout2(self.bn1(x))
         x = torch.mm(x, self.E.weight.transpose(1, 0))
         
@@ -177,34 +187,36 @@ class Spucker(nn.Module):
 
 num_entities  = len(entities)
 num_relations = len(relations)
-num_epochs    = 500
-lr            = 0.005
-batch_size    = 1024
-emb_dim       = 200
-decay_rate    = 0.995
+batch_size    = 128
+# decay_rate    = 1.0
 
 from torch.optim.lr_scheduler import ExponentialLR
 
 model = Spucker(
     num_entities=num_entities,
     num_relations=num_relations,
-    ent_emb_dim=emb_dim,
-    rel_emb_dim=emb_dim,
+    ent_emb_dim=args.edim,
+    rel_emb_dim=args.rdim,
 )
 print(model)
 model = model.cuda()
 
-opt = torch.optim.Adam(model.parameters(), lr=lr)
-lr_scheduler = ExponentialLR(opt, decay_rate)
+opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+# lr_scheduler = ExponentialLR(opt, decay_rate)
 
-for _ in range(num_epochs):
-    idxs   = np.random.permutation(len(train_data_slices))
-    chunks = np.array_split(idxs[:-57], idxs.shape[0] // batch_size)
+for epoch in range(args.epochs):
     
-    all_loss = []
+    # --
+    # Train
+    
+    _ = model.train()
+    
+    idxs   = np.random.permutation(len(train_adjlist))
+    chunks = np.array_split(idxs, idxs.shape[0] // batch_size)
+    
+    train_loss = []
     for chunk in tqdm(chunks):
-        xb, yb = train_data_slices.get_batch(chunk)
-        
+        xb, yb = train_adjlist.get_batch_by_idx(chunk)
         x_s = torch.LongTensor(xb['s']).cuda()
         x_p = torch.LongTensor(xb['p']).cuda()
         y_i = torch.LongTensor(yb['i']).cuda()
@@ -212,16 +224,55 @@ for _ in range(num_epochs):
         
         opt.zero_grad()
         
-        out  = model(x_s, x_p)
-        loss = sparse_bce_with_logits(out, y_i, y_j)
+        pred = model(x_s, x_p)
+        loss = sparse_bce_with_logits(pred, y_i, y_j)
         
         loss.backward()
         opt.step()
         
-        all_loss.append(loss.item())
+        train_loss.append(loss.item())
     
-    print('loss=%f' % np.mean(all_loss), file=sys.stderr)
+    # lr_scheduler.step()
     
-    lr_scheduler.step()
-
+    # --
+    # Eval
+    
+    _ = model.eval()
+    
+    idxs   = np.arange(len(valid_adjlist))
+    chunks = np.array_split(idxs, idxs.shape[0] // batch_size)
+    
+    all_ranks = []
+    for chunk in chunks:
+        
+        # Get validation batch
+        xb, yb = valid_adjlist.get_batch_by_idx(chunk)
+        x_s = torch.LongTensor(xb['s']).cuda()
+        x_p = torch.LongTensor(xb['p']).cuda()
+        y_i = torch.LongTensor(yb['i']).cuda()
+        y_j = torch.LongTensor(yb['j']).cuda()
+        
+        pred = model(x_s, x_p)
+        pred = torch.sigmoid(pred)
+        target_pred = pred[(y_i, y_j)]
+        
+        # Get all true edges for keys
+        _, ayb = all_adjlist.get_batch_by_keys(zip(xb['s'], xb['p']))
+        ay_i   = torch.LongTensor(ayb['i']).cuda()
+        ay_j   = torch.LongTensor(ayb['j']).cuda()
+        
+        pred[(ay_i, ay_j)] = 0
+        
+        ranks = (target_pred.view(-1, 1) < pred[y_i]).sum(dim=-1)
+        all_ranks.append(ranks.cpu().numpy())
+    
+    all_ranks = np.hstack(all_ranks)
+    
+    print(json.dumps({
+        "epoch"      : int(epoch),
+        "train_loss" : float(np.mean(train_loss)),
+        "h_at_10"    : float(np.mean(all_ranks < 10)),
+        "h_at_03"    : float(np.mean(all_ranks < 3)),
+        "h_at_01"    : float(np.mean(all_ranks < 1)),
+    }))
 

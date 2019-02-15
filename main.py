@@ -141,12 +141,12 @@ class Experiment:
             model.eval()
             
             if not it % 10:
-            with torch.no_grad():
-                print("Validation:")
-                self.evaluate(model, d.valid_data)
-                
-                print("Test:")
-                self.evaluate(model, d.test_data)
+                with torch.no_grad():
+                    print("Validation:")
+                    self.evaluate(model, d.valid_data)
+                    
+                    print("Test:")
+                    self.evaluate(model, d.test_data)
 
 
 def parse_args():
